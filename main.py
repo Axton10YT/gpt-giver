@@ -39,7 +39,8 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 150
+    # Renamed the parameter to match the new API spec for GPT-5 models
+    max_completion_tokens: Optional[int] = 150
 
 class ImageGenerationRequest(BaseModel):
     """Pydantic model for an image generation request."""

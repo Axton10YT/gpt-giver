@@ -1,72 +1,140 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from openai import AsyncOpenAI
-import os
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
-from typing import Optional, Literal
-from fastapi.responses import JSONResponse
+import os
+import httpx
+import json
+import asyncio
 
 # Load environment variables from .env file
 load_dotenv()
 
+# The single OpenAI API key from the environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Check if the API key is set
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not found. Please set it in your .env file.")
+
 app = FastAPI(
-    title="OpenAI API Wrapper",
-    description="FastAPI app to access OpenAI GPT models (including GPT-5 family",
-    version="1.1.0"
+    title="OpenAI Proxy API",
+    description="A simple FastAPI proxy to route requests to OpenAI's API using a single key.",
+    version="1.0.0",
 )
 
-# Initialize OpenAI client with API key from .env
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Shared HTTP client for making requests to OpenAI
+client = httpx.AsyncClient(timeout=30.0)
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
-# Pydantic models for request validation
-class ChatRequest(BaseModel):
-    prompt: str
-    model: Literal["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"] = "gpt-4o"
-    max_tokens: Optional[int] = 100
+class Message(BaseModel):
+    """Pydantic model for a single chat message."""
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    """Pydantic model for a chat completion request."""
+    model: str
+    messages: List[Message]
+    stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 150
 
-class ImageRequest(BaseModel):
+class ImageGenerationRequest(BaseModel):
+    """Pydantic model for an image generation request."""
+    model: str
     prompt: str
-    model: Literal["dall-e-3", "dall-e-2"] = "dall-e-3"
-    size: Literal["1024x1024", "512x512", "256x256"] = "1024x1024"
-    quality: Literal["standard", "hd"] = "standard"
     n: Optional[int] = 1
+    size: Optional[str] = "1024x1024"
+    quality: Optional[str] = "standard"
 
-# Root endpoint
-@app.get("/")
-async def root():
-    return {"message": "Welcome to the OpenAI API Wrapper. Use /chat for GPT models (including GPT-5 family) or /image for DALL-E."}
+async def stream_openai_response(request_data: Dict[str, Any]):
+    """
+    Asynchronously streams the response from the OpenAI chat completions endpoint.
+    This function handles Server-Sent Events (SSE) for real-time output.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+    
+    # Send the request to OpenAI's chat completions endpoint
+    async with client.stream(
+        "POST",
+        f"{OPENAI_BASE_URL}/chat/completions",
+        headers=headers,
+        json=request_data
+    ) as response:
+        # Re-raise HTTP errors to be caught by the FastAPI exception handler
+        response.raise_for_status()
+        
+        # Iterate over the response stream and yield chunks as SSE
+        async for chunk in response.aiter_bytes():
+            yield chunk
 
-# Chat endpoint for GPT models
-@app.post("/chat")
-async def chat(request: ChatRequest):
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, request_body: ChatCompletionRequest):
+    """
+    Proxy endpoint for OpenAI's chat completions.
+    Forwards the request to OpenAI, handling both streaming and non-streaming responses.
+    """
+    # Create the payload to be sent to OpenAI
+    payload = request_body.dict(exclude_none=True)
+    
+    if request_body.stream:
+        # If streaming is requested, return a StreamingResponse
+        return StreamingResponse(stream_openai_response(payload), media_type="text/event-stream")
+    
     try:
-        response = await client.chat.completions.create(
-            model=request.model,
-            messages=[{"role": "user", "content": request.prompt}],
-            max_tokens=request.max_tokens,
-            temperature=request.temperature
-        )
-        return {"response": response.choices[0].message.content}
+        # If not streaming, send a standard POST request
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        
+        # Make the request to OpenAI
+        response = await client.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Return the response directly
+        return JSONResponse(response.json())
+        
+    except httpx.HTTPStatusError as e:
+        # Handle HTTP errors from OpenAI
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error calling OpenAI API: {str(e)}")
+        # Handle other potential errors
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Image generation endpoint for DALL-E
-@app.post("/image")
-async def generate_image(request: ImageRequest):
+@app.post("/v1/images/generations")
+async def image_generations(request: Request, request_body: ImageGenerationRequest):
+    """
+    Proxy endpoint for OpenAI's image generation.
+    Forwards the request to OpenAI and returns the image data.
+    """
+    # Create the payload to be sent to OpenAI
+    payload = request_body.dict(exclude_none=True)
+    
     try:
-        response = await client.images.generate(
-            model=request.model,
-            prompt=request.prompt,
-            size=request.size,
-            quality=request.quality,
-            n=request.n
-        )
-        return {"images": [image.url for image in response.data]}
+        # Send the POST request to OpenAI
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}"
+        }
+        response = await client.post(f"{OPENAI_BASE_URL}/images/generations", headers=headers, json=payload)
+        response.raise_for_status()
+        
+        # Return the response directly
+        return JSONResponse(response.json())
+        
+    except httpx.HTTPStatusError as e:
+        # Handle HTTP errors from OpenAI
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error generating image: {str(e)}")
+        # Handle other potential errors
+        raise HTTPException(status_code=500, detail=str(e))
 
-# Health check endpoint
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

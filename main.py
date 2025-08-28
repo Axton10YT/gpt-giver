@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
@@ -22,6 +23,16 @@ app = FastAPI(
     title="OpenAI Proxy API",
     description="A simple FastAPI proxy to route requests to OpenAI's API using a single key.",
     version="1.0.0",
+)
+
+# CORS configuration to allow requests from all origins
+# This is crucial for local web apps or apps hosted on different domains
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, PUT, DELETE, etc.)
+    allow_headers=["*"],  # Allows all headers
 )
 
 # Shared HTTP client for making requests to OpenAI
